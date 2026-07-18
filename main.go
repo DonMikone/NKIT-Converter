@@ -93,11 +93,13 @@ func run(input, output string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Restoring %s -> %s\n", input, output)
-	restoreFn := restore
+	var nkitCrc uint32
+	exact := true
 	if isWii {
-		restoreFn = restoreWii
+		nkitCrc, exact, err = restoreWii(src, outf, srcLen, progressBar())
+	} else {
+		nkitCrc, err = restore(src, outf, srcLen, progressBar())
 	}
-	nkitCrc, err := restoreFn(src, outf, srcLen, progressBar())
 	fmt.Fprintln(os.Stderr) // finish the progress line
 	if err != nil {
 		outf.Close()
@@ -107,6 +109,10 @@ func run(input, output string) error {
 		return err
 	}
 
+	if !exact {
+		fmt.Printf("CRC32 check skipped — output is playable but NOT bit-exact (update partition zero-filled)\n")
+		return nil
+	}
 	gotCrc, err := crc32File(output)
 	if err != nil {
 		return err

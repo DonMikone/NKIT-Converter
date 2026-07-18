@@ -27,6 +27,37 @@ func TestOffsetConversions(t *testing.T) {
 	}
 }
 
+// TestParseWiiPartitionTableRebased checks that the same parser reads both the
+// live table at 0x40000 and the original-table backup NKit stores at offset 0
+// of the update-partition placeholder (whose entry pointers still reference
+// the 0x40000 disc window).
+func TestParseWiiPartitionTableRebased(t *testing.T) {
+	placeholder := make([]byte, 0x8000)
+	putBE32(placeholder, 0, 2)            // group 0: 2 partitions
+	putBE32(placeholder, 4, 0x40020/4)    // entry table "at" 0x40020
+	putBE32(placeholder, 0x20, 0x50000/4) // update partition
+	putBE32(placeholder, 0x24, ptUpdate)
+	putBE32(placeholder, 0x28, 0xF800000/4) // data partition
+	putBE32(placeholder, 0x2c, ptData)
+
+	parts := parseWiiPartitionTable(placeholder, 0)
+	if len(parts) != 2 {
+		t.Fatalf("got %d partitions, want 2", len(parts))
+	}
+	if parts[0].rawOffset != 0x50000 || parts[0].typ != ptUpdate {
+		t.Errorf("first = {%#x, %d}, want update at 0x50000", parts[0].rawOffset, parts[0].typ)
+	}
+	if parts[1].rawOffset != 0xF800000 || parts[1].typ != ptData {
+		t.Errorf("second = {%#x, %d}, want data at 0xF800000", parts[1].rawOffset, parts[1].typ)
+	}
+
+	hdr := make([]byte, wiiHeaderSize)
+	copy(hdr[0x40000:], placeholder[:0x100])
+	if got := parseWiiPartitions(hdr); len(got) != 2 || got[1].rawOffset != 0xF800000 {
+		t.Errorf("live-table parse mismatch: %+v", got)
+	}
+}
+
 // TestClusterRoundTrip checks that a freshly hashed+encrypted group decrypts
 // back to its payload and that the stored H0 hashes match that payload — i.e.
 // the hash-tree layout and per-cluster AES are internally consistent.

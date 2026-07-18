@@ -140,18 +140,31 @@ type wiiPart struct {
 }
 
 func parseWiiPartitions(hdr []byte) []wiiPart {
+	return parseWiiPartitionTable(hdr, 0x40000)
+}
+
+// parseWiiPartitionTable parses a Wii partition table whose four group headers
+// start at b[tableBase]. The entry-table pointers stored in the group headers
+// are absolute disc offsets (value*4, normally inside 0x40000..0x40100), so
+// they are rebased onto tableBase; that lets the same parser read the
+// original-table backup NKit keeps at the start of the update-partition
+// placeholder (where the table sits at offset 0).
+func parseWiiPartitionTable(b []byte, tableBase int) []wiiPart {
 	var parts []wiiPart
 	for t := 0; t < 4; t++ {
-		count := be32(hdr, 0x40000+t*8)
+		count := be32(b, tableBase+t*8)
 		if count == 0 {
 			continue
 		}
-		tableOff := int(be32(hdr, 0x40000+t*8+4)) * 4
+		tableOff := int(be32(b, tableBase+t*8+4))*4 - 0x40000 + tableBase
 		for i := 0; i < int(count); i++ {
 			e := tableOff + i*8
+			if e < 0 || e+8 > len(b) {
+				break
+			}
 			parts = append(parts, wiiPart{
-				rawOffset:   int64(be32(hdr, e)) * 4,
-				typ:         be32(hdr, e+4),
+				rawOffset:   int64(be32(b, e)) * 4,
+				typ:         be32(b, e+4),
 				tableOffset: e,
 			})
 		}
@@ -168,25 +181,20 @@ const (
 
 // ---- main restore --------------------------------------------------------
 
-func restoreWii(in io.Reader, outFile *os.File, inLen int64, progress func(cur, total int64)) (uint32, error) {
+func restoreWii(in io.Reader, outFile *os.File, inLen int64, progress func(cur, total int64)) (uint32, bool, error) {
 	br := bufio.NewReaderSize(in, 1<<20)
 	hdr := make([]byte, wiiHeaderSize)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return 0, fmt.Errorf("reading disc header: %w", err)
+		return 0, false, fmt.Errorf("reading disc header: %w", err)
 	}
 	if string(hdr[0x200:0x208]) != "NKIT v01" {
-		return 0, errors.New("not an NKit v01 image (marker missing at 0x200)")
+		return 0, false, errors.New("not an NKit v01 image (marker missing at 0x200)")
 	}
 	nkitCrc := be32(hdr, 0x208)
 	imageSize := int64(be32(hdr, 0x210)) * 4
 	updateCrc := be32(hdr, 0x218)
 	discID := [4]byte{hdr[0], hdr[1], hdr[2], hdr[3]}
 	discNo := hdr[6]
-
-	if updateCrc != 0 {
-		return 0, fmt.Errorf("this Wii image has its update partition removed (needs external "+
-			"Redump recovery file *_%08X); standalone restore is not possible", updateCrc)
-	}
 
 	// zero the NKit metadata window + the two no-hash/no-crypt flag bytes
 	for i := 0x200; i < 0x21c; i++ {
@@ -196,12 +204,48 @@ func restoreWii(in io.Reader, outFile *os.File, inLen int64, progress func(cur, 
 
 	parts := parseWiiPartitions(hdr)
 	if len(parts) == 0 {
-		return 0, errors.New("no partitions found")
+		return 0, false, errors.New("no partitions found")
+	}
+
+	// A non-zero updateCrc means the update partition was removed when this
+	// image was shrunk — its bytes are simply not in the file. NKit left a
+	// placeholder in its place whose first 0x100 bytes back up the original
+	// partition table. Mirror official NKit's missing-recovery behaviour:
+	// zero-fill the whole original update region and restore that exact
+	// table, which yields a playable but not bit-exact image.
+	var origTable []byte
+	var zeroFillEnd int64
+	if updateCrc != 0 {
+		fillLen := parts[0].rawOffset - wiiHeaderSize
+		if fillLen <= 0 || fillLen > 1<<20 {
+			return 0, false, fmt.Errorf("unexpected update-partition placeholder size 0x%X", fillLen)
+		}
+		placeholder := make([]byte, fillLen)
+		if _, err := io.ReadFull(br, placeholder); err != nil {
+			return 0, false, fmt.Errorf("reading update-partition placeholder: %w", err)
+		}
+		origParts := parseWiiPartitionTable(placeholder, 0)
+		var first *wiiPart
+		for i := range origParts {
+			if origParts[i].typ != ptUpdate && origParts[i].rawOffset >= wiiHeaderSize {
+				first = &origParts[i]
+				break
+			}
+		}
+		if first == nil {
+			return 0, false, errors.New("update-partition placeholder holds no usable partition table")
+		}
+		origTable = placeholder[:0x100]
+		zeroFillEnd = first.rawOffset
+		fmt.Fprintf(os.Stderr, "WARNING: this image was shrunk by removing its update partition (*_%08X);\n"+
+			"         that data is not in the file, so the region is zero-filled instead.\n"+
+			"         The ISO works in Dolphin and USB loaders, but is NOT bit-exact\n"+
+			"         (not redump-verifiable) and may not boot on an unmodified console.\n", updateCrc)
 	}
 
 	bw := bufio.NewWriterSize(outFile, 1<<20)
 	if _, err := bw.Write(hdr); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	st := &wiiState{br: br, bw: bw, imageSize: imageSize, discID: discID, discNo: discNo,
@@ -209,44 +253,70 @@ func restoreWii(in io.Reader, outFile *os.File, inLen int64, progress func(cur, 
 		tempDir: filepath.Dir(outFile.Name())}
 	st.lastType = 0xffffffff // "Other"
 
+	if origTable != nil {
+		if err := writeZeros(bw, zeroFillEnd-wiiHeaderSize); err != nil {
+			return 0, false, err
+		}
+		st.srcPos = parts[0].rawOffset
+		st.dstPos = zeroFillEnd
+	}
+
 	for i := range parts {
 		p := &parts[i]
 		if p.rawOffset > st.srcPos {
 			if err := st.writeFiller(); err != nil {
-				return 0, err
+				return 0, false, err
 			}
 			if err := st.discard(p.rawOffset - st.srcPos); err != nil {
-				return 0, err
+				return 0, false, err
 			}
 			st.srcPos = p.rawOffset
 		}
 		p.origOffset = st.dstPos
 		if err := st.restorePartition(p); err != nil {
-			return 0, fmt.Errorf("partition at 0x%X: %w", p.rawOffset, err)
+			return 0, false, fmt.Errorf("partition at 0x%X: %w", p.rawOffset, err)
 		}
 	}
 
 	if st.srcPos < inLen {
 		if err := st.writeFiller(); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
 
-	// rewrite the partition table offsets to the reconstructed original positions
-	for _, p := range parts {
-		putBE32(hdr, p.tableOffset, uint32(p.origOffset/4))
+	if origTable != nil {
+		// restore the exact original partition table (update entry included)
+		copy(hdr[0x40000:0x40100], origTable)
+	} else {
+		// rewrite the partition table offsets to the reconstructed original positions
+		for _, p := range parts {
+			putBE32(hdr, p.tableOffset, uint32(p.origOffset/4))
+		}
 	}
 
 	if st.dstPos != imageSize {
-		return 0, fmt.Errorf("reconstructed %d bytes, expected %d", st.dstPos, imageSize)
+		return 0, false, fmt.Errorf("reconstructed %d bytes, expected %d", st.dstPos, imageSize)
 	}
 	if err := bw.Flush(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if _, err := outFile.WriteAt(hdr, 0); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return nkitCrc, nil
+	return nkitCrc, origTable == nil, nil
+}
+
+// writeZeros streams n zero bytes to w.
+func writeZeros(w io.Writer, n int64) error {
+	buf := make([]byte, 1<<20)
+	for n > 0 {
+		c := min64(n, int64(len(buf)))
+		if _, err := w.Write(buf[:c]); err != nil {
+			return err
+		}
+		n -= c
+	}
+	return nil
 }
 
 type wiiState struct {

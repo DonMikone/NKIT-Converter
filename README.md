@@ -20,11 +20,12 @@ CRC32 099E2C6D  MATCH (redump-verified)
 > **GameCube and Wii are both supported and byte-exact** (GameCube and Wii
 > single/multi-partition discs, including scrubbed dumps). Input may be a plain
 > `.nkit.iso` or a GCZ-compressed `.nkit.gcz`, which is transparently
-> decompressed. The one case that
-> can't be restored from the `.nkit.iso` alone is a Wii image whose **update
-> partition was removed** — that data isn't in the file and needs an external
-> Redump recovery partition, so it's detected and reported. See
-> [Limitations](#limitations).
+> decompressed. The one case that can't be restored byte-exact from the
+> `.nkit.iso` alone is a Wii image whose **update partition was removed** —
+> that data isn't in the file. These images are still converted to a full-size,
+> playable ISO (the missing region is zero-filled, exactly like official NKit
+> does without recovery files), with a clear warning that the result is not
+> redump-verifiable. See [Limitations](#limitations).
 
 ## Install
 
@@ -90,7 +91,9 @@ nkit2iso game.nkit.gcz          # -> game.iso
 
 The exit code is `0` only when the reconstructed ISO's CRC32 matches the value
 stored in the NKit header. Any mismatch or error exits non-zero and the
-half-written output is removed.
+half-written output is removed. The one exception is a Wii image whose update
+partition was removed at shrink time: the CRC check is skipped (it cannot
+match), a warning is printed, and the playable ISO is kept with exit code `0`.
 
 ## How it works
 
@@ -123,11 +126,20 @@ is used — still zero external dependencies.
 
 ## Limitations
 
-- **Wii images with the update partition removed.** Some Wii `.nkit.iso` files
-  were shrunk by dropping the update (system-menu/IOS) partition, whose data is
-  not stored in the file and cannot be regenerated. Restoring these byte-exact
-  needs the matching external Redump recovery partition (`*_<CRC8>`). `nkit2iso`
-  detects this and reports it rather than emitting a wrong image.
+- **Wii images with the update partition removed are playable, not bit-exact.**
+  Some Wii `.nkit.iso` files were shrunk by dropping the update
+  (system-menu/IOS) partition, whose data is not stored in the file and cannot
+  be regenerated. `nkit2iso` restores these to a full-size ISO anyway: the
+  original partition table (which NKit backs up inside the image) is put back
+  and the update partition's region is zero-filled — the same thing official
+  NKit does when its recovery files are missing. The result boots in Dolphin
+  and USB loaders, but is not redump-verifiable and may not boot on an
+  unmodified console, so a warning is printed and the final CRC32 check is
+  skipped. Restoring these images *byte-exact* would additionally need the
+  matching external recovery partition file (`*_<CRC8>`, where the CRC is
+  shown in the warning); the update partition data is shared between many
+  games and such recovery files are archived publicly (e.g. the
+  "NKit Recovery Partitions" collection on archive.org).
 
 ## Build from source
 
